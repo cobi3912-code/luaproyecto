@@ -1,58 +1,111 @@
 --[[
-    DCA Console Error Collector V1.0
-    --------------------------------
-    Captura PASIVA de logs visibles para el cliente.
+    DCA Console FULL Capture V2.0
+    =============================
+    Captura PASIVA de TODO el output de consola observable por el CLIENTE.
 
     Fuentes:
-      * LogService:GetLogHistory() -> historial disponible al iniciar.
-      * LogService.MessageOut -> mensajes nuevos mientras está activo.
+      1) LogService:GetLogHistory()  -> historial disponible al arrancar.
+      2) LogService.MessageOut       -> mensajes nuevos en tiempo real.
+      3) ScriptContext.Error          -> stack trace/error estructurado cuando
+                                         la API está disponible.
 
-    No usa hooks de __namecall/__index/__newindex, no dispara remotes,
-    no cambia estado del juego y no borra la consola.
+    Tipos capturados por defecto:
+      MessageOutput, MessageInfo, MessageWarning, MessageError.
 
-    Exporta JSON + TXT y puede copiar JSON al clipboard si el executor
-    expone setclipboard().
+    Salida principal:
+      DCA_Console_FULL.txt
+
+    El archivo se escribe en el workspace/directorio de archivos del executor
+    que exponga writefile(). Si appendfile() existe, los eventos se añaden sin
+    reescribir todo el fichero. Si no existe, se usa writefile() como fallback.
+
+    NO:
+      - no usa __namecall/__index/__newindex hooks;
+      - no dispara remotes;
+      - no modifica el estado del juego;
+      - no borra la consola;
+      - no intenta leer logs del servidor.
+
+    Nota:
+      LogService expone MessageOut(message, messageType, context) y
+      GetLogHistory(); MessageType distingue Output, Info, Warning y Error.
 ]]
+
+--------------------------------------------------------------------
+-- SERVICES
+--------------------------------------------------------------------
 
 local HttpService = game:GetService("HttpService")
 local LogService = game:GetService("LogService")
+local ScriptContext = game:GetService("ScriptContext")
+
+--------------------------------------------------------------------
+-- CONFIG
+--------------------------------------------------------------------
 
 local CONFIG = {
-    INCLUDE_WARNINGS = true,
-    INCLUDE_OUTPUT = false,
+    FILE_NAME = "DCA_Console_FULL.txt",
+
+    -- "TODO" significa TODOS los MessageType.
+    CAPTURE_OUTPUT = true,
+    CAPTURE_INFO = true,
+    CAPTURE_WARNINGS = true,
+    CAPTURE_ERRORS = true,
+
     CAPTURE_HISTORY = true,
-    DEDUPE = true,
-    MAX_ENTRIES = 5000,
-    MAX_MESSAGE_LENGTH = 12000,
-    MAX_CONTEXT_JSON_LENGTH = 4000,
-    WRITE_FILES = true,
-    -- "TXT" is easiest to paste into a chat/editor; "JSON" is easier for tooling.
-    CLIPBOARD_MODE = "TXT",
-    FOLDER = "ClientConsoleLogs",
+    CAPTURE_SCRIPT_CONTEXT_ERRORS = true,
+
+    -- 0 = ilimitado (sujeto a memoria/disco del executor).
+    MAX_MESSAGE_LENGTH = 0,
+    MAX_STACKTRACE_LENGTH = 0,
+    MAX_CONTEXT_LENGTH = 0,
+
+    -- Evita duplicar exactamente el mismo item histórico si la implementación
+    -- del runtime entrega parte del historial mientras llega MessageOut.
+    DEDUPE_EXACT = true,
+
+    -- Si appendfile está disponible, escribir cada evento evita perder logs
+    -- si el executor/juego se cierra inesperadamente.
+    FLUSH_EACH_EVENT = true,
+
+    WRITE_HEADER = true,
 }
+
+--------------------------------------------------------------------
+-- EXECUTOR API DISCOVERY
+--------------------------------------------------------------------
 
 local function resolveGlobal(name, expectedType)
     local candidates = {}
 
-    local okEnv, env = pcall(getfenv)
-    if okEnv and type(env) == "table" then candidates[#candidates + 1] = env end
-
-    local okFenv, fenv = pcall(getfenv, 0)
-    if okFenv and type(fenv) == "table" then candidates[#candidates + 1] = fenv end
-
-    local okGetgenv, getgenvFn = pcall(function()
-        return rawget(_G, "getgenv")
-    end)
-    if okGetgenv and type(getgenvFn) == "function" then
-        local okGenv, genv = pcall(getgenvFn)
-        if okGenv and type(genv) == "table" then candidates[#candidates + 1] = genv end
+    local ok1, env1 = pcall(getfenv)
+    if ok1 and type(env1) == "table" then
+        candidates[#candidates + 1] = env1
     end
 
-    if type(_G) == "table" then candidates[#candidates + 1] = _G end
+    local ok2, env2 = pcall(getfenv, 0)
+    if ok2 and type(env2) == "table" then
+        candidates[#candidates + 1] = env2
+    end
 
-    for _, envTable in ipairs(candidates) do
-        local okValue, value = pcall(rawget, envTable, name)
-        if okValue and value ~= nil
+    local ok3, getgenvFn = pcall(function()
+        return rawget(_G, "getgenv")
+    end)
+
+    if ok3 and type(getgenvFn) == "function" then
+        local ok4, genv = pcall(getgenvFn)
+        if ok4 and type(genv) == "table" then
+            candidates[#candidates + 1] = genv
+        end
+    end
+
+    if type(_G) == "table" then
+        candidates[#candidates + 1] = _G
+    end
+
+    for _, env in ipairs(candidates) do
+        local ok, value = pcall(rawget, env, name)
+        if ok and value ~= nil
             and (expectedType == nil or type(value) == expectedType)
         then
             return value
@@ -63,352 +116,530 @@ local function resolveGlobal(name, expectedType)
 end
 
 local WRITE_FILE = resolveGlobal("writefile", "function")
+local APPEND_FILE = resolveGlobal("appendfile", "function")
 local IS_FOLDER = resolveGlobal("isfolder", "function")
 local MAKE_FOLDER = resolveGlobal("makefolder", "function")
-local SET_CLIPBOARD = resolveGlobal("setclipboard", "function")
+
+--------------------------------------------------------------------
+-- STATE
+--------------------------------------------------------------------
 
 local Collector = {
-
     Active = false,
-    Connection = nil,
-    Entries = {},
-    ByFingerprint = {},
-    RawObserved = 0,
-    Errors = 0,
-    Warnings = 0,
-    Output = 0,
-    History = 0,
-    Live = 0,
-    Dropped = 0,
+    MessageConnection = nil,
+    ScriptErrorConnection = nil,
+
     StartedAtClock = nil,
     StartedAtTime = nil,
-    StoppedAtClock = nil,
-    StoppedAtTime = nil,
+
+    FilePath = CONFIG.FILE_NAME,
+    FileReady = false,
+    FileMode = "none",
+
+    MessageCount = 0,
+    OutputCount = 0,
+    InfoCount = 0,
+    WarningCount = 0,
+    ErrorCount = 0,
+    ScriptContextErrorCount = 0,
+    HistoryCount = 0,
+    LiveCount = 0,
+    WriteFailures = 0,
+
+    Seen = {},
 }
 
-local function safeString(value, maxLength)
-    local s = tostring(value or "")
-    if #s > maxLength then
-        return s:sub(1, maxLength) .. " …[TRUNCATED]"
+--------------------------------------------------------------------
+-- HELPERS
+--------------------------------------------------------------------
+
+local function limitString(value, maxLength)
+    local text = tostring(value == nil and "" or value)
+
+    if type(maxLength) ~= "number" or maxLength <= 0 then
+        return text
     end
-    return s
+
+    if #text <= maxLength then
+        return text
+    end
+
+    return text:sub(1, maxLength) .. " ... [TRUNCATED]"
 end
 
-local function enumName(messageType)
-    local ok, name = pcall(function() return messageType.Name end)
-    return (ok and type(name) == "string" and name ~= "") and name or tostring(messageType)
+local function enumName(value)
+    local ok, name = pcall(function()
+        return value and value.Name
+    end)
+
+    if ok and type(name) == "string" and name ~= "" then
+        return name
+    end
+
+    return tostring(value)
 end
 
-local function classify(messageType)
+local function classifyMessage(messageType)
     local name = enumName(messageType)
-    if name == "MessageError" then return "ERROR" end
-    if name == "MessageWarning" then return "WARNING" end
+
+    if name == "MessageError" then
+        return "ERROR"
+    end
+
+    if name == "MessageWarning" then
+        return "WARNING"
+    end
+
+    if name == "MessageInfo" then
+        return "INFO"
+    end
+
     return "OUTPUT"
 end
 
-local function shouldKeep(kind)
-    if kind == "ERROR" then return true end
-    if kind == "WARNING" then return CONFIG.INCLUDE_WARNINGS end
-    return CONFIG.INCLUDE_OUTPUT
-end
-
-local function contextToJSON(context)
-    if type(context) ~= "table" then return nil end
-    local ok, encoded = pcall(function() return HttpService:JSONEncode(context) end)
-    if not ok then return nil end
-    return safeString(encoded, CONFIG.MAX_CONTEXT_JSON_LENGTH)
-end
-
-local function isoNow()
-    local ok, value = pcall(function() return DateTime.now():ToIsoDate() end)
-    return ok and value or os.date("!%Y-%m-%dT%H:%M:%SZ")
-end
-
-local function fingerprint(kind, message, contextJSON)
-    -- Separadores NUL mantienen las columnas inequívocas incluso si el texto contiene '|'.
-    return kind .. "\0" .. message .. "\0" .. (contextJSON or "")
-end
-
-local function ensureFolder()
-    if not WRITE_FILE then return false end
-    if not IS_FOLDER or not MAKE_FOLDER then return true end
-    return pcall(function()
-        if not IS_FOLDER(CONFIG.FOLDER) then MAKE_FOLDER(CONFIG.FOLDER) end
-    end)
-end
-
-local function addEntry(message, messageType, context, origin)
-    local kind = classify(messageType)
-    if not shouldKeep(kind) then return end
-
-    Collector.RawObserved += 1
-
-    local safeMessage = safeString(message, CONFIG.MAX_MESSAGE_LENGTH)
-    local contextJSON = contextToJSON(context)
-    local fp = fingerprint(kind, safeMessage, contextJSON)
-    local nowClock = os.clock()
-    local nowTime = os.time()
-    local nowISO = isoNow()
-
-    if CONFIG.DEDUPE then
-        local existing = Collector.ByFingerprint[fp]
-        if existing then
-            existing.Count += 1
-            existing.LastSeenClock = nowClock
-            existing.LastSeenTime = nowTime
-            existing.LastSeenISO = nowISO
-            return
-        end
-    end
-
-    if #Collector.Entries >= CONFIG.MAX_ENTRIES then
-        Collector.Dropped += 1
-        return
-    end
-
-    local entry = {
-        Index = #Collector.Entries + 1,
-        Kind = kind,
-        Message = safeMessage,
-        Origin = origin,
-        Count = 1,
-        FirstSeenClock = nowClock,
-        FirstSeenTime = nowTime,
-        FirstSeenISO = nowISO,
-        LastSeenClock = nowClock,
-        LastSeenTime = nowTime,
-        LastSeenISO = nowISO,
-        ContextJSON = contextJSON,
-    }
-
-    Collector.Entries[#Collector.Entries + 1] = entry
-    if CONFIG.DEDUPE then Collector.ByFingerprint[fp] = entry end
-
+local function shouldCapture(kind)
     if kind == "ERROR" then
-        Collector.Errors += 1
+        return CONFIG.CAPTURE_ERRORS
     elseif kind == "WARNING" then
-        Collector.Warnings += 1
-    else
-        Collector.Output += 1
+        return CONFIG.CAPTURE_WARNINGS
+    elseif kind == "INFO" then
+        return CONFIG.CAPTURE_INFO
     end
 
-    if origin == "history" then Collector.History += 1 else Collector.Live += 1 end
+    return CONFIG.CAPTURE_OUTPUT
 end
 
-local function captureHistory()
-    if not CONFIG.CAPTURE_HISTORY then return end
-
-    local ok, history = pcall(function()
-        return LogService:GetLogHistory()
-    end)
-    if not ok or type(history) ~= "table" then return end
-
-    for _, item in ipairs(history) do
-        local message = item.Message
-        local messageType = item.MessageType
-        local context = item.Context
-        if message ~= nil and messageType ~= nil then
-            addEntry(message, messageType, context, "history")
-        end
-    end
-end
-
-function Collector.Start()
-    if Collector.Active then return false, "already_active" end
-
-    Collector.Active = true
-    Collector.StartedAtClock = os.clock()
-    Collector.StartedAtTime = os.time()
-
-    captureHistory()
-
-    local ok, connection = pcall(function()
-        return LogService.MessageOut:Connect(function(message, messageType, context)
-            if Collector.Active then
-                addEntry(message, messageType, context, "live")
-            end
-        end)
+local function nowISO()
+    local ok, result = pcall(function()
+        return DateTime.now():ToIsoDate()
     end)
 
-    if not ok or not connection then
-        Collector.Active = false
-        return false, "MessageOut_connect_failed"
+    if ok then
+        return result
     end
 
-    Collector.Connection = connection
-    return true, "started"
+    return os.date("!%Y-%m-%dT%H:%M:%SZ")
 end
 
-local function buildSnapshot()
-    return {
-        CollectorVersion = "1.0.0",
-        CapturedAtISO = isoNow(),
-        StartedAtClock = Collector.StartedAtClock,
-        StartedAtTime = Collector.StartedAtTime,
-        StoppedAtClock = Collector.StoppedAtClock,
-        StoppedAtTime = Collector.StoppedAtTime,
-        Statistics = {
-            RawObserved = Collector.RawObserved,
-            Stored = #Collector.Entries,
-            Errors = Collector.Errors,
-            Warnings = Collector.Warnings,
-            Output = Collector.Output,
-            History = Collector.History,
-            Live = Collector.Live,
-            Dropped = Collector.Dropped,
-        },
-        Configuration = {
-            CaptureHistory = CONFIG.CAPTURE_HISTORY,
-            IncludeWarnings = CONFIG.INCLUDE_WARNINGS,
-            IncludeOutput = CONFIG.INCLUDE_OUTPUT,
-            Dedupe = CONFIG.DEDUPE,
-            MaxEntries = CONFIG.MAX_ENTRIES,
-            MaxMessageLength = CONFIG.MAX_MESSAGE_LENGTH,
-        },
-        Entries = Collector.Entries,
-    }
+local function wallClockDetailed()
+    return os.date("!%Y-%m-%d %H:%M:%S")
 end
 
-local function buildText(snapshot)
+local function contextToText(context)
+    if context == nil then
+        return ""
+    end
+
+    local ok, encoded = pcall(function()
+        return HttpService:JSONEncode(context)
+    end)
+
+    if ok and type(encoded) == "string" then
+        return limitString(encoded, CONFIG.MAX_CONTEXT_LENGTH)
+    end
+
+    return limitString(tostring(context), CONFIG.MAX_CONTEXT_LENGTH)
+end
+
+local function formatHeader()
     local lines = {
-        "=== Deep Client Auditor - Console Errors ===",
-        "CapturedAt: " .. safeString(snapshot.CapturedAtISO, 64),
-        "Stored: " .. tostring(snapshot.Statistics.Stored),
-        "Errors: " .. tostring(snapshot.Statistics.Errors),
-        "Warnings: " .. tostring(snapshot.Statistics.Warnings),
-        "Dropped: " .. tostring(snapshot.Statistics.Dropped),
+        "================================================================================",
+        "DCA CONSOLE FULL CAPTURE",
+        "================================================================================",
+        "StartedISO: " .. nowISO(),
+        "StartedWall: " .. wallClockDetailed(),
+        "PlaceId: " .. tostring(game.PlaceId),
+        "JobId: " .. tostring(game.JobId),
+        "Capture: MessageOutput + MessageInfo + MessageWarning + MessageError",
+        "History: " .. tostring(CONFIG.CAPTURE_HISTORY),
+        "ScriptContext.Error: " .. tostring(CONFIG.CAPTURE_SCRIPT_CONTEXT_ERRORS),
+        "================================================================================",
         "",
     }
-
-    for _, entry in ipairs(snapshot.Entries) do
-        lines[#lines + 1] = string.format(
-            "[%s] x%d [%s] [%s]",
-            safeString(entry.FirstSeenISO, 64),
-            entry.Count,
-            entry.Kind,
-            entry.Origin
-        )
-        lines[#lines + 1] = entry.Message
-        if entry.ContextJSON then lines[#lines + 1] = "Context: " .. entry.ContextJSON end
-        lines[#lines + 1] = string.rep("-", 80)
-    end
 
     return table.concat(lines, "\n")
 end
 
-local exportSequence = 0
-
-local function filePath(ext)
-    exportSequence += 1
-    return string.format(
-        "%s/Console_%d_%d_%d.%s",
-        CONFIG.FOLDER,
-        game.PlaceId,
-        os.time(),
-        exportSequence,
-        ext
-    )
-end
-
-function Collector.Export()
-    local snapshot = buildSnapshot()
-    local okJSON, json = pcall(function() return HttpService:JSONEncode(snapshot) end)
-    if not okJSON then return false, "JSONEncode_failed" end
-
-    local textOutput = buildText(snapshot)
-    local jsonPath, txtPath
-    local wroteJSON, wroteTXT = false, false
-
-    if CONFIG.WRITE_FILES and WRITE_FILE then
-        ensureFolder()
-        jsonPath = filePath("json")
-        txtPath = filePath("txt")
-
-        wroteJSON = pcall(function() WRITE_FILE(jsonPath, json) end)
-        wroteTXT = pcall(function() WRITE_FILE(txtPath, textOutput) end)
+local function prepareFile()
+    if type(WRITE_FILE) ~= "function" then
+        return false, "writefile_unavailable"
     end
 
-    if SET_CLIPBOARD then
-        if CONFIG.CLIPBOARD_MODE == "TXT" then
-            pcall(function() SET_CLIPBOARD(textOutput) end)
-        elseif CONFIG.CLIPBOARD_MODE == "JSON" then
-            pcall(function() SET_CLIPBOARD(json) end)
+    local path = CONFIG.FILE_NAME
+
+    local ok, err = pcall(function()
+        -- El archivo queda en el directorio de archivos/workspace del executor.
+        WRITE_FILE(path, "")
+    end)
+
+    if not ok then
+        return false, tostring(err)
+    end
+
+    Collector.FilePath = path
+    Collector.FileReady = true
+    Collector.FileMode = type(APPEND_FILE) == "function" and "appendfile" or "rewrite"
+
+    if CONFIG.WRITE_HEADER then
+        local header = formatHeader()
+
+        if Collector.FileMode == "appendfile" then
+            pcall(function()
+                APPEND_FILE(path, header)
+            end)
+        else
+            Collector._RewriteBuffer = header
+            pcall(function()
+                WRITE_FILE(path, header)
+            end)
         end
     end
 
-    snapshot.JSONPath = wroteJSON and jsonPath or nil
-    snapshot.TXTPath = wroteTXT and txtPath or nil
-
-    return true, {
-        JSON = json,
-        TXT = textOutput,
-        Snapshot = snapshot,
-        JSONPath = snapshot.JSONPath,
-        TXTPath = snapshot.TXTPath,
-        WroteFiles = wroteJSON or wroteTXT,
-    }
+    return true
 end
 
-function Collector.Stop(exportAfterStop)
-    if not Collector.Active then return false, "not_active" end
-
-    Collector.Active = false
-    Collector.StoppedAtClock = os.clock()
-    Collector.StoppedAtTime = os.time()
-
-    if Collector.Connection then
-        pcall(function() Collector.Connection:Disconnect() end)
-        Collector.Connection = nil
+local function writeFullText(text)
+    if not Collector.FileReady then
+        return false
     end
 
-    if exportAfterStop == nil then exportAfterStop = true end
-    if exportAfterStop then return Collector.Export() end
+    local ok = false
+
+    if Collector.FileMode == "appendfile" then
+        ok = pcall(function()
+            APPEND_FILE(Collector.FilePath, text)
+        end)
+    else
+        -- Rewrite fallback: read current file is intentionally avoided because
+        -- not every executor exposes readfile consistently. The in-memory buffer
+        -- below is authoritative for this mode.
+        ok = pcall(function()
+            WRITE_FILE(Collector.FilePath, Collector._RewriteBuffer or "")
+        end)
+    end
+
+    if not ok then
+        Collector.WriteFailures += 1
+    end
+
+    return ok
+end
+
+Collector._RewriteBuffer = ""
+
+local function persist(text)
+    if Collector.FileMode == "rewrite" then
+        Collector._RewriteBuffer = Collector._RewriteBuffer .. text
+    end
+
+    return writeFullText(text)
+end
+
+local function exactKey(kind, message, contextText)
+    return kind .. "\0" .. message .. "\0" .. contextText
+end
+
+local function makeConsoleLine(kind, origin, message, contextText)
+    local lines = {}
+
+    lines[#lines + 1] = string.format(
+        "[%s] [%s] [%s] Clock=%.6f Time=%d",
+        nowISO(),
+        kind,
+        origin,
+        os.clock(),
+        os.time()
+    )
+
+    lines[#lines + 1] = "Message: " .. message
+
+    if contextText ~= "" then
+        lines[#lines + 1] = "Context: " .. contextText
+    end
+
+    lines[#lines + 1] = "--------------------------------------------------------------------------------"
+
+    return table.concat(lines, "\n") .. "\n"
+end
+
+--------------------------------------------------------------------
+-- RECORD MESSAGEOUT
+--------------------------------------------------------------------
+
+local function recordMessage(message, messageType, context, origin)
+    local kind = classifyMessage(messageType)
+
+    if not shouldCapture(kind) then
+        return
+    end
+
+    local safeMessage = limitString(message, CONFIG.MAX_MESSAGE_LENGTH)
+    local contextText = contextToText(context)
+
+    if CONFIG.DEDUPE_EXACT then
+        local key = exactKey(kind, safeMessage, contextText)
+
+        -- Only suppress an immediately repeated history/live duplicate once;
+        -- repeated identical console messages are still captured as separate
+        -- console events. This preserves "TODO" semantics.
+        if origin == "history" and Collector.Seen[key] then
+            return
+        end
+
+        if origin == "history" then
+            Collector.Seen[key] = true
+        end
+    end
+
+    Collector.MessageCount += 1
+
+    if origin == "history" then
+        Collector.HistoryCount += 1
+    else
+        Collector.LiveCount += 1
+    end
+
+    if kind == "ERROR" then
+        Collector.ErrorCount += 1
+    elseif kind == "WARNING" then
+        Collector.WarningCount += 1
+    elseif kind == "INFO" then
+        Collector.InfoCount += 1
+    else
+        Collector.OutputCount += 1
+    end
+
+    persist(makeConsoleLine(kind, origin, safeMessage, contextText))
+end
+
+--------------------------------------------------------------------
+-- SCRIPT CONTEXT ERROR
+--------------------------------------------------------------------
+
+local function recordScriptContextError(message, stackTrace, script)
+    if not CONFIG.CAPTURE_SCRIPT_CONTEXT_ERRORS then
+        return
+    end
+
+    Collector.ScriptContextErrorCount += 1
+
+    local scriptName = "<unknown>"
+    local scriptPath = "<unknown>"
+
+    if typeof(script) == "Instance" then
+        local okName, name = pcall(function() return script.Name end)
+        if okName then scriptName = tostring(name) end
+
+        local okPath, fullName = pcall(function() return script:GetFullName() end)
+        if okPath then scriptPath = tostring(fullName) end
+    end
+
+    local safeMessage = limitString(message, CONFIG.MAX_MESSAGE_LENGTH)
+    local safeStack = limitString(stackTrace, CONFIG.MAX_STACKTRACE_LENGTH)
+
+    local lines = {
+        string.format(
+            "[%s] [SCRIPT_CONTEXT_ERROR] [live] Clock=%.6f Time=%d",
+            nowISO(),
+            os.clock(),
+            os.time()
+        ),
+        "Message: " .. safeMessage,
+        "ScriptName: " .. scriptName,
+        "ScriptPath: " .. scriptPath,
+        "StackTrace:",
+        safeStack,
+        "--------------------------------------------------------------------------------",
+    }
+
+    persist(table.concat(lines, "\n") .. "\n")
+end
+
+--------------------------------------------------------------------
+-- HISTORY
+--------------------------------------------------------------------
+
+local function captureHistory()
+    if not CONFIG.CAPTURE_HISTORY then
+        return
+    end
+
+    local ok, history = pcall(function()
+        return LogService:GetLogHistory()
+    end)
+
+    if not ok or type(history) ~= "table" then
+        persist(string.format(
+            "[%s] [COLLECTOR] GetLogHistory failed/unavailable: %s\n--------------------------------------------------------------------------------\n",
+            nowISO(),
+            tostring(history)
+        ))
+        return
+    end
+
+    for _, item in ipairs(history) do
+        if type(item) == "table" then
+            local message = item.message or item.Message
+            local messageType = item.messageType or item.MessageType
+            local context = item.context or item.Context
+
+            if message ~= nil and messageType ~= nil then
+                recordMessage(message, messageType, context, "history")
+            end
+        end
+    end
+end
+
+--------------------------------------------------------------------
+-- PUBLIC API
+--------------------------------------------------------------------
+
+function Collector.Start()
+    if Collector.Active then
+        return false, "already_active"
+    end
+
+    if type(WRITE_FILE) ~= "function" then
+        warn("[DCA Console FULL] Delta/executor no expone writefile().")
+        return false, "writefile_unavailable"
+    end
+
+    Collector.StartedAtClock = os.clock()
+    Collector.StartedAtTime = os.time()
+    Collector.Active = true
+
+    local fileOK, fileErr = prepareFile()
+    if not fileOK then
+        Collector.Active = false
+        warn("[DCA Console FULL] No se pudo preparar " .. CONFIG.FILE_NAME .. ": " .. tostring(fileErr))
+        return false, "file_prepare_failed"
+    end
+
+    -- Suscribirse primero minimiza la ventana en la que podrían entrar mensajes
+    -- nuevos entre historial y evento live.
+    local messageOK, messageConnection = pcall(function()
+        return LogService.MessageOut:Connect(function(message, messageType, context)
+            if Collector.Active then
+                recordMessage(message, messageType, context, "live")
+            end
+        end)
+    end)
+
+    if messageOK and messageConnection then
+        Collector.MessageConnection = messageConnection
+    else
+        Collector.Active = false
+        warn("[DCA Console FULL] LogService.MessageOut no pudo conectarse.")
+        return false, "messageout_connect_failed"
+    end
+
+    if CONFIG.CAPTURE_SCRIPT_CONTEXT_ERRORS then
+        local scriptOK, scriptConnection = pcall(function()
+            return ScriptContext.Error:Connect(function(message, stackTrace, script)
+                if Collector.Active then
+                    recordScriptContextError(message, stackTrace, script)
+                end
+            end)
+        end)
+
+        if scriptOK and scriptConnection then
+            Collector.ScriptErrorConnection = scriptConnection
+        end
+    end
+
+    captureHistory()
+
+    persist(string.format(
+        "[%s] [COLLECTOR] STARTED; file=%s; mode=%s\n--------------------------------------------------------------------------------\n",
+        nowISO(),
+        Collector.FilePath,
+        Collector.FileMode
+    ))
+
+    print("[DCA Console FULL] Capturando TODO el output del cliente en: " .. Collector.FilePath)
+    print("[DCA Console FULL] Error/Warning/Info/Output + historial + ScriptContext.Error")
+
+    return true, "started"
+end
+
+function Collector.Stop()
+    if not Collector.Active then
+        return false, "not_active"
+    end
+
+    Collector.Active = false
+
+    if Collector.MessageConnection then
+        pcall(function()
+            Collector.MessageConnection:Disconnect()
+        end)
+        Collector.MessageConnection = nil
+    end
+
+    if Collector.ScriptErrorConnection then
+        pcall(function()
+            Collector.ScriptErrorConnection:Disconnect()
+        end)
+        Collector.ScriptErrorConnection = nil
+    end
+
+    persist(string.format(
+        "[%s] [COLLECTOR] STOPPED\n",
+        nowISO()
+    ))
+
+    print(string.format(
+        "[DCA Console FULL] detenido. Output=%d Info=%d Warning=%d Error=%d ScriptErrors=%d History=%d Live=%d WriteFailures=%d",
+        Collector.OutputCount,
+        Collector.InfoCount,
+        Collector.WarningCount,
+        Collector.ErrorCount,
+        Collector.ScriptContextErrorCount,
+        Collector.HistoryCount,
+        Collector.LiveCount,
+        Collector.WriteFailures
+    ))
+
     return true, "stopped"
 end
 
-function Collector.Clear()
-    if Collector.Active then return false, "stop_before_clear" end
-
-    Collector.Entries = {}
-    Collector.ByFingerprint = {}
-    Collector.RawObserved = 0
-    Collector.Errors = 0
-    Collector.Warnings = 0
-    Collector.Output = 0
-    Collector.History = 0
-    Collector.Live = 0
-    Collector.Dropped = 0
-    Collector.StartedAtClock = nil
-    Collector.StartedAtTime = nil
-    Collector.StoppedAtClock = nil
-    Collector.StoppedAtTime = nil
-
-    return true, "cleared"
+function Collector.Status()
+    return {
+        Active = Collector.Active,
+        FilePath = Collector.FilePath,
+        FileReady = Collector.FileReady,
+        FileMode = Collector.FileMode,
+        MessageCount = Collector.MessageCount,
+        OutputCount = Collector.OutputCount,
+        InfoCount = Collector.InfoCount,
+        WarningCount = Collector.WarningCount,
+        ErrorCount = Collector.ErrorCount,
+        ScriptContextErrorCount = Collector.ScriptContextErrorCount,
+        HistoryCount = Collector.HistoryCount,
+        LiveCount = Collector.LiveCount,
+        WriteFailures = Collector.WriteFailures,
+    }
 end
+
+--------------------------------------------------------------------
+-- AUTOSTART
+--------------------------------------------------------------------
 
 local ok, status = Collector.Start()
 
--- Exposición opcional para ejecutar Stop/Export/Clear desde otra entrada del executor.
-do
-    local okGetgenv, getgenvFn = pcall(function() return rawget(_G, "getgenv") end)
-    if okGetgenv and type(getgenvFn) == "function" then
-        local okEnv, env = pcall(getgenvFn)
-        if okEnv and type(env) == "table" then
-            env.DCAConsoleCollector = Collector
-        end
-    end
-    if type(_G) == "table" then
-        _G.DCAConsoleCollector = Collector
-    end
+if not ok then
+    warn("[DCA Console FULL] Start failed: " .. tostring(status))
 end
 
-if ok then
-    print("[DCA Console Collector] activo")
-    print("  DCAConsoleCollector:Stop(true)  -> detener + exportar + copiar")
-    print("  DCAConsoleCollector:Export()    -> exportar sin detener")
-    print("  DCAConsoleCollector:Clear()     -> limpiar después de detener")
-else
-    warn("[DCA Console Collector] no pudo iniciarse: " .. tostring(status))
-end
+-- Dejar una referencia estable para la sesión.
+pcall(function()
+    local env = resolveGlobal("getgenv", "function")
+    if type(env) == "function" then
+        local genv = env()
+        if type(genv) == "table" then
+            genv.DCA_Console_FULL = Collector
+        end
+    end
+end)
 
 return Collector
